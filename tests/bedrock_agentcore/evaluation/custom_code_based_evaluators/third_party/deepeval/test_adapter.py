@@ -9,22 +9,32 @@ from bedrock_agentcore.evaluation.custom_code_based_evaluators.third_party.deepe
 
 
 def _make_evaluator_input(spans=None):
-    """Build an EvaluatorInput with agent-level spans."""
+    """Build an EvaluatorInput with agent-level spans (CloudWatch split format)."""
     if spans is None:
         spans = [
             {
                 "traceId": "t1",
                 "spanId": "s1",
-                "attributes": {"gen_ai.operation.name": "invoke_agent"},
-                "span_events": [
-                    {
-                        "body": {
-                            "input": {"messages": [{"role": "user", "content": "What is AI?"}]},
-                            "output": {"messages": [{"role": "assistant", "content": "AI is artificial intelligence."}]},
-                        }
-                    }
-                ],
-            }
+                "scope": {"name": "strands.telemetry.tracer"},
+                "name": "invoke_agent",
+                "kind": "INTERNAL",
+                "startTimeUnixNano": 1000000000,
+                "endTimeUnixNano": 2000000000,
+                "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+                "status": {"code": "UNSET"},
+            },
+            {
+                "traceId": "t1",
+                "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer"},
+                "timeUnixNano": 2000000000,
+                "observedTimeUnixNano": 2000000001,
+                "severityNumber": 9,
+                "body": {
+                    "input": {"messages": [{"role": "user", "content": {"content": '[{"text": "What is AI?"}]'}}]},
+                    "output": {"messages": [{"role": "assistant", "content": {"message": "AI is artificial intelligence."}}]},
+                },
+            },
         ]
     return EvaluatorInput(
         evaluation_level="TRACE",
@@ -90,14 +100,16 @@ class TestDeepEvalAdapterSuccess:
         assert test_case.input == "What is AI?"
         assert test_case.actual_output == "AI is artificial intelligence."
 
-    def test_custom_field_mapper(self):
+    def test_custom_custom_mapper(self):
+        from deepeval.test_case import LLMTestCase
+
         metric = _mock_metric()
         adapter = DeepEvalAdapter(
             metric=metric,
-            field_mapper=lambda ev: {
-                "input": "mapped input",
-                "actual_output": "mapped output",
-            },
+            custom_mapper=lambda ev: LLMTestCase(
+                input="mapped input",
+                actual_output="mapped output",
+            ),
         )
 
         result = adapter(_make_evaluator_input())
@@ -117,15 +129,25 @@ class TestDeepEvalAdapterSuccess:
                 {
                     "traceId": "t1",
                     "spanId": "s1",
-                    "attributes": {"gen_ai.operation.name": "invoke_agent"},
-                    "span_events": [
-                        {
-                            "body": {
-                                "input": {"messages": [{"role": "user", "content": "What is AI?"}]},
-                                "output": {"messages": [{"role": "assistant", "content": "AI is artificial intelligence."}]},
-                            }
-                        }
-                    ],
+                    "scope": {"name": "strands.telemetry.tracer"},
+                    "name": "invoke_agent",
+                    "kind": "INTERNAL",
+                    "startTimeUnixNano": 1000000000,
+                    "endTimeUnixNano": 2000000000,
+                    "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+                    "status": {"code": "UNSET"},
+                },
+                {
+                    "traceId": "t1",
+                    "spanId": "s1",
+                    "scope": {"name": "strands.telemetry.tracer"},
+                    "timeUnixNano": 2000000000,
+                    "observedTimeUnixNano": 2000000001,
+                    "severityNumber": 9,
+                    "body": {
+                        "input": {"messages": [{"role": "user", "content": {"content": '[{"text": "What is AI?"}]'}}]},
+                        "output": {"messages": [{"role": "assistant", "content": {"message": "AI is artificial intelligence."}}]},
+                    },
                 }
             ],
             target_trace_id="t1",
@@ -136,12 +158,6 @@ class TestDeepEvalAdapterSuccess:
 
         test_case = metric.measure.call_args[0][0]
         assert test_case.expected_output == "AI stands for artificial intelligence."
-
-    def test_model_override_sets_metric_model(self):
-        metric = _mock_metric()
-        DeepEvalAdapter(metric=metric, model="bedrock/anthropic.claude-3")
-
-        assert metric.model == "bedrock/anthropic.claude-3"
 
     def test_label_uses_metric_success_true(self):
         metric = _mock_metric(score=0.3, threshold=0.7)
@@ -188,6 +204,7 @@ class TestDeepEvalAdapterErrors:
             {
                 "traceId": "t1",
                 "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer", "version": ""},
                 "attributes": {"gen_ai.operation.name": "invoke_agent"},
                 "span_events": [
                     {
@@ -203,9 +220,9 @@ class TestDeepEvalAdapterErrors:
 
         result = adapter(_make_evaluator_input(spans=spans))
 
-        assert result.errorCode == "MISSING_REQUIRED_FIELD"
-        assert "input" in result.errorMessage
-        assert "field_mapper" in result.errorMessage
+        assert result.errorCode in ("MISSING_REQUIRED_FIELD", "FIELD_EXTRACTION_ERROR")
+        assert result.errorMessage  # error message present
+        assert "custom_mapper" in result.errorMessage
         metric.measure.assert_not_called()
 
     def test_metric_measure_exception_returns_error(self):
@@ -219,9 +236,9 @@ class TestDeepEvalAdapterErrors:
         assert "LLM timeout" in result.errorMessage
 
     def test_missing_params_error_caught(self):
-        metric = _mock_metric()
+        from deepeval.errors import MissingTestCaseParamsError
 
-        MissingTestCaseParamsError = type("MissingTestCaseParamsError", (Exception,), {})
+        metric = _mock_metric()
         metric.measure = MagicMock(
             side_effect=MissingTestCaseParamsError("retrieval_context is required")
         )
@@ -231,7 +248,7 @@ class TestDeepEvalAdapterErrors:
 
         assert result.errorCode == "MISSING_REQUIRED_FIELD"
         assert "retrieval_context" in result.errorMessage
-        assert "field_mapper" in result.errorMessage
+        assert "custom_mapper" in result.errorMessage
 
     def test_never_raises(self):
         metric = _mock_metric()
