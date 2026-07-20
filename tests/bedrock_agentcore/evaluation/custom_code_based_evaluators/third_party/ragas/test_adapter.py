@@ -9,22 +9,32 @@ from bedrock_agentcore.evaluation.custom_code_based_evaluators.third_party.ragas
 
 
 def _make_evaluator_input(spans=None):
-    """Build an EvaluatorInput with agent-level spans."""
+    """Build an EvaluatorInput with agent-level spans (CloudWatch split format)."""
     if spans is None:
         spans = [
             {
                 "traceId": "t1",
                 "spanId": "s1",
-                "attributes": {"gen_ai.operation.name": "invoke_agent"},
-                "span_events": [
-                    {
-                        "body": {
-                            "input": {"messages": [{"role": "user", "content": "What is AI?"}]},
-                            "output": {"messages": [{"role": "assistant", "content": "AI is artificial intelligence."}]},
-                        }
-                    }
-                ],
-            }
+                "scope": {"name": "strands.telemetry.tracer"},
+                "name": "invoke_agent",
+                "kind": "INTERNAL",
+                "startTimeUnixNano": 1000000000,
+                "endTimeUnixNano": 2000000000,
+                "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+                "status": {"code": "UNSET"},
+            },
+            {
+                "traceId": "t1",
+                "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer"},
+                "timeUnixNano": 2000000000,
+                "observedTimeUnixNano": 2000000001,
+                "severityNumber": 9,
+                "body": {
+                    "input": {"messages": [{"role": "user", "content": {"content": '[{"text": "What is AI?"}]'}}]},
+                    "output": {"messages": [{"role": "assistant", "content": {"message": "AI is artificial intelligence."}}]},
+                },
+            },
         ]
     return EvaluatorInput(
         evaluation_level="TRACE",
@@ -117,15 +127,15 @@ class TestRAGASAdapterSuccess:
         assert result.label == "Pass"
 
     @patch(f"{RAGAS_MODULE}.evaluate")
-    def test_custom_field_mapper(self, mock_evaluate):
+    def test_custom_mapper(self, mock_evaluate):
         mock_evaluate.return_value = _mock_evaluate_result("faithfulness", 0.9)
         metric = _mock_ragas_metric(name="faithfulness")
         adapter = RAGASAdapter(
             metric=metric,
-            field_mapper=lambda ev: {
-                "input": "mapped input",
-                "actual_output": "mapped output",
-                "retrieval_context": ["some context"],
+            custom_mapper=lambda ev: {
+                "user_input": "mapped input",
+                "response": "mapped output",
+                "retrieved_contexts": ["some context"],
             },
         )
 
@@ -145,16 +155,26 @@ class TestRAGASAdapterSuccess:
                 {
                     "traceId": "t1",
                     "spanId": "s1",
-                    "attributes": {"gen_ai.operation.name": "invoke_agent"},
-                    "span_events": [
-                        {
-                            "body": {
-                                "input": {"messages": [{"role": "user", "content": "What is AI?"}]},
-                                "output": {"messages": [{"role": "assistant", "content": "AI is artificial intelligence."}]},
-                            }
-                        }
-                    ],
-                }
+                    "scope": {"name": "strands.telemetry.tracer"},
+                    "name": "invoke_agent",
+                    "kind": "INTERNAL",
+                    "startTimeUnixNano": 1000000000,
+                    "endTimeUnixNano": 2000000000,
+                    "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+                    "status": {"code": "UNSET"},
+                },
+                {
+                    "traceId": "t1",
+                    "spanId": "s1",
+                    "scope": {"name": "strands.telemetry.tracer"},
+                    "timeUnixNano": 2000000000,
+                    "observedTimeUnixNano": 2000000001,
+                    "severityNumber": 9,
+                    "body": {
+                        "input": {"messages": [{"role": "user", "content": {"content": '[{"text": "What is AI?"}]'}}]},
+                        "output": {"messages": [{"role": "assistant", "content": {"message": "AI is artificial intelligence."}}]},
+                    },
+                },
             ],
             target_trace_id="t1",
             reference_inputs=[{"expectedResponse": {"text": "AI stands for artificial intelligence."}}],
@@ -196,7 +216,7 @@ class TestRAGASAdapterErrors:
         result = adapter(_make_evaluator_input(spans=spans))
 
         assert isinstance(result, EvaluatorOutput)
-        assert result.errorCode in ("FIELD_EXTRACTION_ERROR", "MISSING_REQUIRED_FIELD")
+        assert result.errorCode == "FIELD_EXTRACTION_ERROR"
         assert result.label == "Error"
 
     @patch(f"{RAGAS_MODULE}.evaluate")
@@ -274,18 +294,44 @@ class TestRAGASAdapterEdgeCases:
         assert result.label == "Pass"
 
     @patch(f"{RAGAS_MODULE}.evaluate")
-    def test_retrieval_context_as_string_converted_to_list(self, mock_evaluate):
+    def test_custom_mapper_with_ragas_columns(self, mock_evaluate):
+        """custom_mapper returns RAGAS-native column names directly."""
         mock_evaluate.return_value = _mock_evaluate_result("faithfulness", 0.9)
         metric = _mock_ragas_metric(name="faithfulness")
         adapter = RAGASAdapter(
             metric=metric,
-            field_mapper=lambda ev: {
-                "input": "question",
-                "actual_output": "answer",
-                "retrieval_context": "single string context",
+            custom_mapper=lambda ev: {
+                "user_input": "question",
+                "response": "answer",
+                "retrieved_contexts": ["context 1", "context 2"],
             },
         )
 
         result = adapter(_make_evaluator_input())
 
         assert result.value == 0.9
+
+    def test_missing_input_returns_error(self):
+        """Spans with no extractable input should return MISSING_REQUIRED_FIELD."""
+        spans = [
+            {
+                "traceId": "t1",
+                "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer", "version": ""},
+                "attributes": {"gen_ai.operation.name": "invoke_agent"},
+                "span_events": [
+                    {
+                        "body": {
+                            "output": {"messages": [{"role": "assistant", "content": "answer"}]},
+                        }
+                    }
+                ],
+            }
+        ]
+        metric = _mock_ragas_metric()
+        adapter = RAGASAdapter(metric=metric)
+
+        result = adapter(_make_evaluator_input(spans=spans))
+
+        assert result.errorCode in ("MISSING_REQUIRED_FIELD", "FIELD_EXTRACTION_ERROR")
+        assert result.errorMessage

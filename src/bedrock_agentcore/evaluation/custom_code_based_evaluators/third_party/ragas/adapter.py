@@ -1,7 +1,7 @@
 """RAGAS adapter for AgentCore code-based evaluators."""
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from datasets import Dataset
 from ragas import evaluate
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 class RAGASAdapter(BaseAdapter):
     """Adapter that runs a RAGAS metric against AgentCore evaluation events.
 
-    Example::
+    Example (default span mapping)::
 
         from ragas.metrics import Faithfulness
         from langchain_aws import ChatBedrockConverse
@@ -27,12 +27,29 @@ class RAGASAdapter(BaseAdapter):
             region_name="us-east-1",
         ))
         adapter = RAGASAdapter(metric=Faithfulness(), llm=eval_llm)
+
+    Example (custom mapper returning RAGAS dataset dict)::
+
+        from typing import Dict, Any
+
+        def my_mapper(ev: EvaluatorInput) -> Dict[str, Any]:
+            return {
+                "user_input": ev.session_spans[0]["attributes"]["question"],
+                "response": ev.session_spans[0]["attributes"]["answer"],
+                "retrieved_contexts": ["some context"],
+            }
+
+        adapter = RAGASAdapter(
+            metric=Faithfulness(),
+            llm=eval_llm,
+            custom_mapper=my_mapper,
+        )
     """
 
     def __init__(
         self,
         metric: Any,
-        field_mapper: Optional[Callable[[EvaluatorInput], Dict[str, Any]]] = None,
+        custom_mapper: Optional[Callable[[EvaluatorInput], Dict[str, Any]]] = None,
         llm: Optional[Any] = None,
         embeddings: Optional[Any] = None,
     ):
@@ -41,74 +58,65 @@ class RAGASAdapter(BaseAdapter):
         Args:
             metric: A RAGAS metric instance (e.g., Faithfulness(), ContextRecall()).
                 Must have a .name attribute and support ragas.evaluate().
-            field_mapper: Optional callable that receives the EvaluatorInput and
-                returns a dict with RAGAS-compatible keys. Bypasses default span
-                parsing when provided.
+            custom_mapper: Optional callable that receives the EvaluatorInput and
+                returns a dict with RAGAS-compatible dataset column keys
+                (user_input, response, reference, retrieved_contexts, reference_contexts).
+                Bypasses default span mapping when provided.
             llm: Optional LLM wrapper to set on the metric (e.g., LangchainLLMWrapper).
                 Required for most RAGAS metrics when not using OpenAI.
             embeddings: Optional embeddings wrapper to set on the metric.
                 Required for embedding-based metrics (AnswerSimilarity, AnswerCorrectness).
         """
-        super().__init__(field_mapper=field_mapper)
         self.metric = metric
+        self.custom_mapper = custom_mapper
 
         if llm is not None:
             self.metric.llm = llm
         if embeddings is not None and hasattr(self.metric, "embeddings"):
             self.metric.embeddings = embeddings
 
-    def validate_fields(self, fields: Dict[str, Any]) -> None:
-        """Validate that required fields for this RAGAS metric are present.
+    def _run(self, evaluator_input: EvaluatorInput) -> EvaluatorOutput:
+        """Run the RAGAS metric pipeline."""
+        if self.custom_mapper is not None:
+            dataset_dict = self.custom_mapper(evaluator_input)
+            # Wrap scalar values in lists for Dataset.from_dict
+            dataset_dict = {k: [v] if not isinstance(v, list) else [v] for k, v in dataset_dict.items()}
+        else:
+            result = self._default_extract(evaluator_input)
+            if not result.input or not result.actual_output:
+                missing: List[str] = []
+                if not result.input:
+                    missing.append("input")
+                if not result.actual_output:
+                    missing.append("actual_output")
+                metric_name = type(self.metric).__name__
+                return EvaluatorOutput(
+                    label="Error",
+                    errorCode="MISSING_REQUIRED_FIELD",
+                    errorMessage=f"Field(s) {missing} required by {metric_name} but not found in evaluation event. "
+                    f"Provide a custom_mapper or ensure spans contain the necessary data.",
+                )
 
-        The span parser produces fields with keys: 'input', 'actual_output',
-        'expected_output', 'context', 'retrieval_context'. We map these to
-        RAGAS column names in execute().
-        """
-        if not fields.get("input") and not fields.get("actual_output"):
-            metric_name = type(self.metric).__name__
-            raise ValueError(
-                f"Neither 'input' nor 'actual_output' found in evaluation event. "
-                f"{metric_name} requires at minimum a user input and agent response. "
-                f"Provide a field_mapper or ensure spans contain the necessary data."
-            )
+            # Map SpanMapResult fields to RAGAS dataset columns
+            dataset_dict: Dict[str, list] = {
+                "user_input": [result.input],
+                "response": [result.actual_output],
+            }
 
-    def execute(self, fields: Dict[str, Any]) -> EvaluatorOutput:
-        """Run the RAGAS metric and return formatted results.
+            # Add optional columns based on what's available
+            if result.expected_output:
+                dataset_dict["reference"] = [result.expected_output]
 
-        Maps the standard span parser fields to RAGAS dataset columns:
-            input          → user_input
-            actual_output  → response
-            expected_output → reference
-            retrieval_context → retrieved_contexts
-            context        → reference_contexts (fallback)
-        """
+            # Use assertions as reference if no expected_output
+            if not result.expected_output and result.assertions:
+                dataset_dict["reference"] = ["\n".join(result.assertions)]
 
-        # Map span parser fields → RAGAS dataset columns
-        dataset_dict: Dict[str, list] = {
-            "user_input": [fields.get("input", "")],
-            "response": [fields.get("actual_output", "")],
-        }
-
-        # Add optional columns based on what's available
-        expected = fields.get("expected_output")
-        if expected:
-            dataset_dict["reference"] = [expected]
-
-        retrieval_ctx = fields.get("retrieval_context")
-        if retrieval_ctx:
-            # retrieval_context from span parser may be a list or a single string
-            if isinstance(retrieval_ctx, str):
-                retrieval_ctx = [retrieval_ctx]
-            dataset_dict["retrieved_contexts"] = [retrieval_ctx]
-            # reference_contexts defaults to retrieved_contexts for metrics that need it
-            dataset_dict["reference_contexts"] = [retrieval_ctx]
-
-        context = fields.get("context")
-        if context and "retrieved_contexts" not in dataset_dict:
-            if isinstance(context, str):
-                context = [context]
-            dataset_dict["retrieved_contexts"] = [context]
-            dataset_dict["reference_contexts"] = [context]
+            if result.retrieval_context:
+                dataset_dict["retrieved_contexts"] = [result.retrieval_context]
+                dataset_dict["reference_contexts"] = [result.retrieval_context]
+            elif result.context:
+                dataset_dict["retrieved_contexts"] = [result.context]
+                dataset_dict["reference_contexts"] = [result.context]
 
         dataset = Dataset.from_dict(dataset_dict)
 
