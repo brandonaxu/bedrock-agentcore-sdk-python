@@ -335,3 +335,208 @@ class TestRAGASAdapterEdgeCases:
 
         assert result.errorCode in ("MISSING_REQUIRED_FIELD", "FIELD_EXTRACTION_ERROR")
         assert result.errorMessage
+
+
+def _make_evaluator_input_with_embedded_text(user_content: str):
+    """Build an EvaluatorInput with a specific user message content (for embedded parsing tests)."""
+    spans = [
+        {
+            "traceId": "t1",
+            "spanId": "s1",
+            "scope": {"name": "strands.telemetry.tracer"},
+            "name": "invoke_agent",
+            "kind": "INTERNAL",
+            "startTimeUnixNano": 1000000000,
+            "endTimeUnixNano": 2000000000,
+            "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+            "status": {"code": "UNSET"},
+        },
+        {
+            "traceId": "t1",
+            "spanId": "s1",
+            "scope": {"name": "strands.telemetry.tracer"},
+            "timeUnixNano": 2000000000,
+            "observedTimeUnixNano": 2000000001,
+            "severityNumber": 9,
+            "body": {
+                "input": {"messages": [{"role": "user", "content": {"content": f'[{{"text": "{user_content}"}}]'}}]},
+                "output": {"messages": [{"role": "assistant", "content": {"message": "The answer is 42."}}]},
+            },
+        },
+    ]
+    return EvaluatorInput(
+        evaluation_level="TRACE",
+        session_spans=spans,
+        target_trace_id="t1",
+    )
+
+
+class TestRAGASAdapterEmbeddedReferenceParsing:
+    """Tests for parsing reference text embedded in user_input via build_adot_docs() format."""
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_parses_embedded_reference_from_user_input(self, mock_evaluate):
+        """Reference embedded as '{question}\\n\\nReference Answer:\\n{reference}' is extracted."""
+        mock_evaluate.return_value = _mock_evaluate_result("exact_match", 1.0)
+        metric = _mock_ragas_metric(name="exact_match", threshold=0.5)
+        adapter = RAGASAdapter(metric=metric)
+
+        user_content = "What is 2+2?\\n\\nReference Answer:\\n4"
+        evaluator_input = _make_evaluator_input_with_embedded_text(user_content)
+        result = adapter(evaluator_input)
+
+        assert result.value == 1.0
+        # Verify the dataset passed to evaluate had the reference extracted
+        call_kwargs = mock_evaluate.call_args[1]
+        dataset = call_kwargs["dataset"]
+        assert "reference" in dataset.column_names
+        assert dataset["reference"][0] == "4"
+        assert dataset["user_input"][0] == "What is 2+2?"
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_parses_embedded_context_from_user_input(self, mock_evaluate):
+        """Context embedded as '{question}\\n\\nContext:\\n{context}' is extracted."""
+        mock_evaluate.return_value = _mock_evaluate_result("faithfulness", 0.9)
+        metric = _mock_ragas_metric(name="faithfulness", threshold=0.5)
+        adapter = RAGASAdapter(metric=metric)
+
+        user_content = "What is AI?\\n\\nContext:\\nAI is a branch of computer science."
+        evaluator_input = _make_evaluator_input_with_embedded_text(user_content)
+        result = adapter(evaluator_input)
+
+        assert result.value == 0.9
+        call_kwargs = mock_evaluate.call_args[1]
+        dataset = call_kwargs["dataset"]
+        assert "retrieved_contexts" in dataset.column_names
+        assert dataset["retrieved_contexts"][0] == ["AI is a branch of computer science."]
+        assert "reference_contexts" in dataset.column_names
+        assert dataset["reference_contexts"][0] == ["AI is a branch of computer science."]
+        assert dataset["user_input"][0] == "What is AI?"
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_parses_combined_context_and_reference(self, mock_evaluate):
+        """Combined format '{question}\\n\\nContext:\\n{ctx}\\n\\nReference Answer:\\n{ref}' is parsed."""
+        mock_evaluate.return_value = _mock_evaluate_result("context_precision", 0.75)
+        metric = _mock_ragas_metric(name="context_precision", threshold=0.5)
+        adapter = RAGASAdapter(metric=metric)
+
+        user_content = "What is AI?\\n\\nContext:\\nAI is computer science.\\n\\nReference Answer:\\nArtificial Intelligence"
+        evaluator_input = _make_evaluator_input_with_embedded_text(user_content)
+        result = adapter(evaluator_input)
+
+        assert result.value == 0.75
+        call_kwargs = mock_evaluate.call_args[1]
+        dataset = call_kwargs["dataset"]
+        assert dataset["user_input"][0] == "What is AI?"
+        assert dataset["retrieved_contexts"][0] == ["AI is computer science."]
+        assert dataset["reference"][0] == "Artificial Intelligence"
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_no_embedded_markers_leaves_input_unchanged(self, mock_evaluate):
+        """Plain user_input without markers passes through unchanged."""
+        mock_evaluate.return_value = _mock_evaluate_result("faithfulness", 0.8)
+        metric = _mock_ragas_metric(name="faithfulness", threshold=0.5)
+        adapter = RAGASAdapter(metric=metric)
+
+        evaluator_input = _make_evaluator_input()  # plain "What is AI?"
+        result = adapter(evaluator_input)
+
+        assert result.value == 0.8
+        call_kwargs = mock_evaluate.call_args[1]
+        dataset = call_kwargs["dataset"]
+        assert dataset["user_input"][0] == "What is AI?"
+        assert "reference" not in dataset.column_names
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_reference_inputs_takes_precedence_over_embedded(self, mock_evaluate):
+        """reference_inputs from the service override embedded reference."""
+        mock_evaluate.return_value = _mock_evaluate_result("answer_correctness", 0.9)
+        metric = _mock_ragas_metric(name="answer_correctness", threshold=0.5)
+        adapter = RAGASAdapter(metric=metric)
+
+        # Span has embedded reference, but reference_inputs also provided
+        spans = [
+            {
+                "traceId": "t1",
+                "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer"},
+                "name": "invoke_agent",
+                "kind": "INTERNAL",
+                "startTimeUnixNano": 1000000000,
+                "endTimeUnixNano": 2000000000,
+                "attributes": {"gen_ai.operation.name": "invoke_agent", "session.id": "test-session"},
+                "status": {"code": "UNSET"},
+            },
+            {
+                "traceId": "t1",
+                "spanId": "s1",
+                "scope": {"name": "strands.telemetry.tracer"},
+                "timeUnixNano": 2000000000,
+                "observedTimeUnixNano": 2000000001,
+                "severityNumber": 9,
+                "body": {
+                    "input": {"messages": [{"role": "user", "content": {"content": '[{"text": "Q\\n\\nReference Answer:\\nembedded ref"}]'}}]},
+                    "output": {"messages": [{"role": "assistant", "content": {"message": "answer"}}]},
+                },
+            },
+        ]
+        evaluator_input = EvaluatorInput(
+            evaluation_level="TRACE",
+            session_spans=spans,
+            target_trace_id="t1",
+            reference_inputs=[{"expectedResponse": {"text": "service-provided ref"}}],
+        )
+
+        result = adapter(evaluator_input)
+
+        assert result.value == 0.9
+        call_kwargs = mock_evaluate.call_args[1]
+        dataset = call_kwargs["dataset"]
+        # reference_inputs takes precedence
+        assert dataset["reference"][0] == "service-provided ref"
+
+
+class TestRAGASAdapterThresholdNone:
+    """Tests for handling metrics where threshold is explicitly None."""
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_threshold_none_defaults_to_half(self, mock_evaluate):
+        """When metric.threshold is explicitly None, default to 0.5."""
+        mock_evaluate.return_value = _mock_evaluate_result("semantic_similarity", 0.6)
+        metric = _mock_ragas_metric(name="semantic_similarity")
+        metric.threshold = None  # Explicitly set to None like SemanticSimilarity does
+        adapter = RAGASAdapter(metric=metric)
+
+        result = adapter(_make_evaluator_input())
+
+        assert result.value == 0.6
+        assert result.label == "Pass"  # 0.6 >= 0.5
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_threshold_none_score_below_default(self, mock_evaluate):
+        """Score below 0.5 with threshold=None results in Fail."""
+        mock_evaluate.return_value = _mock_evaluate_result("semantic_similarity", 0.3)
+        metric = _mock_ragas_metric(name="semantic_similarity")
+        metric.threshold = None
+        adapter = RAGASAdapter(metric=metric)
+
+        result = adapter(_make_evaluator_input())
+
+        assert result.value == 0.3
+        assert result.label == "Fail"
+
+    @patch(f"{RAGAS_MODULE}.evaluate")
+    def test_threshold_none_does_not_crash(self, mock_evaluate):
+        """Ensure no TypeError when comparing score >= None."""
+        mock_evaluate.return_value = _mock_evaluate_result("semantic_similarity", 0.85)
+        metric = _mock_ragas_metric(name="semantic_similarity")
+        metric.threshold = None
+        adapter = RAGASAdapter(metric=metric)
+
+        # This would previously raise TypeError: '>=' not supported between float and NoneType
+        result = adapter(_make_evaluator_input())
+
+        assert isinstance(result, EvaluatorOutput)
+        assert result.value == 0.85
+        assert result.label == "Pass"
+        assert "threshold=0.5" in result.explanation

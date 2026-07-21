@@ -11,6 +11,10 @@ from bedrock_agentcore.evaluation.custom_code_based_evaluators.third_party.base 
 
 logger = logging.getLogger(__name__)
 
+# Separators used by build_adot_docs() to embed reference/context in user messages.
+_REFERENCE_SEPARATOR = "\n\nReference Answer:\n"
+_CONTEXT_SEPARATOR = "\n\nContext:\n"
+
 
 class RAGASAdapter(BaseAdapter):
     """Adapter that runs a RAGAS metric against AgentCore evaluation events.
@@ -97,23 +101,42 @@ class RAGASAdapter(BaseAdapter):
                     f"Provide a custom_mapper or ensure spans contain the necessary data.",
                 )
 
+            # Parse embedded reference and context from the user_input field.
+            # build_adot_docs() embeds these as:
+            #   "{user_input}\n\nContext:\n{context}\n\nReference Answer:\n{reference}"
+            user_input = result.input
+            embedded_reference: Optional[str] = None
+            embedded_context: Optional[str] = None
+
+            # Extract reference (must come after context if both present)
+            if _REFERENCE_SEPARATOR in user_input:
+                user_input, embedded_reference = user_input.split(_REFERENCE_SEPARATOR, 1)
+
+            # Extract context from whatever remains as user_input
+            if _CONTEXT_SEPARATOR in user_input:
+                user_input, embedded_context = user_input.split(_CONTEXT_SEPARATOR, 1)
+
             # Map SpanMapResult fields to RAGAS dataset columns
             dataset_dict: Dict[str, list] = {
-                "user_input": [result.input],
+                "user_input": [user_input],
                 "response": [result.actual_output],
             }
 
-            # Add optional columns based on what's available
+            # Reference priority: reference_inputs > embedded > assertions
             if result.expected_output:
                 dataset_dict["reference"] = [result.expected_output]
-
-            # Use assertions as reference if no expected_output
-            if not result.expected_output and result.assertions:
+            elif embedded_reference:
+                dataset_dict["reference"] = [embedded_reference]
+            elif result.assertions:
                 dataset_dict["reference"] = ["\n".join(result.assertions)]
 
+            # Retrieval context priority: span tool results > embedded > SpanMapResult.context
             if result.retrieval_context:
                 dataset_dict["retrieved_contexts"] = [result.retrieval_context]
                 dataset_dict["reference_contexts"] = [result.retrieval_context]
+            elif embedded_context:
+                dataset_dict["retrieved_contexts"] = [[embedded_context]]
+                dataset_dict["reference_contexts"] = [[embedded_context]]
             elif result.context:
                 dataset_dict["retrieved_contexts"] = [result.context]
                 dataset_dict["reference_contexts"] = [result.context]
@@ -151,7 +174,11 @@ class RAGASAdapter(BaseAdapter):
             )
 
         score = float(df[score_col].iloc[0])
-        threshold = getattr(self.metric, "threshold", 0.5)
+
+        # Handle threshold=None (e.g. SemanticSimilarity sets threshold=None by default)
+        threshold = getattr(self.metric, "threshold", None)
+        if threshold is None:
+            threshold = 0.5
         label = "Pass" if score >= threshold else "Fail"
         reason = f"RAGAS {self.metric.name}: {score:.4f} (threshold={threshold})"
 
