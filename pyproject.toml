@@ -151,6 +151,7 @@ dev = [
     "wheel>=0.45.1",
     "strands-agents>=1.20.0",
     "strands-agents-evals>=1.0.0,<2.0.0",
+    "ragas>=0.4.0",
     "langchain>=1.0.0",
     "langgraph>=1.0.0",
     "langchain-mcp-adapters>=0.1.0",
@@ -184,6 +185,10 @@ datasets = [
 ]
 deepeval = [
     "deepeval>=2.0.0",
+    "strands-agents-evals>=1.0.0,<2.0.0",
+]
+ragas = [
+    "ragas>=0.4.0",
     "strands-agents-evals>=1.0.0,<2.0.0",
 ]
 autoevals = [

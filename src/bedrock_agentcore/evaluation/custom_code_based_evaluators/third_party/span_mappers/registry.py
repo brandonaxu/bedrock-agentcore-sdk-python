@@ -1,21 +1,22 @@
-"""Span mapping orchestration — uses strands-evals mappers with auto-detection."""
+"""Span mapping orchestration — uses strands-evals mappers with auto-detection.
+
+strands-evals is imported lazily inside the functions that need it so that
+importing the adapters (e.g. ``RAGASAdapter``) does not require
+strands-agents-evals to be installed. It is only needed when the default span
+mapping actually runs (i.e. no ``custom_mapper`` was provided).
+"""
 
 import logging
 import warnings
-from typing import Any, Dict, List, Optional
-
-from strands_evals.mappers import (
-    LangChainOtelSessionMapper,
-    OpenInferenceSessionMapper,
-    detect_otel_mapper,
-)
-from strands_evals.mappers.utils import get_scope_name
-from strands_evals.types.trace import AgentInvocationSpan, Session, ToolExecutionSpan
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from bedrock_agentcore.evaluation.custom_code_based_evaluators.third_party.span_mappers.common import (
     FieldExtractionError,
     SpanMapResult,
 )
+
+if TYPE_CHECKING:  # pragma: no cover
+    from strands_evals.types.trace import Session
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,13 @@ def _detect_mapper(session_spans: List[Dict[str, Any]]):
       entries) as StrandsInMemorySessionMapper (which expects ReadableSpan objects)
     - Our pre-check handles both cases correctly, then falls back for other formats
     """
-    from strands_evals.mappers import CloudWatchSessionMapper
-    from strands_evals.mappers.utils import get_body
+    from strands_evals.mappers import (
+        CloudWatchSessionMapper,
+        LangChainOtelSessionMapper,
+        OpenInferenceSessionMapper,
+        detect_otel_mapper,
+    )
+    from strands_evals.mappers.utils import get_body, get_scope_name
 
     has_strands_scope = False
     has_body_entry = False
@@ -130,7 +136,7 @@ def map_spans(
     return result
 
 
-def _session_to_span_map_result(session: Session) -> SpanMapResult:
+def _session_to_span_map_result(session: "Session") -> SpanMapResult:
     """Bridge strands-evals Session to SpanMapResult.
 
     Extracts the last AgentInvocationSpan for input/output and all
@@ -141,6 +147,8 @@ def _session_to_span_map_result(session: Session) -> SpanMapResult:
     (e.g. ConversationCompleteness) are not supported. Use custom_mapper
     for multi-turn evaluation needs.
     """
+    from strands_evals.types.trace import AgentInvocationSpan, ToolExecutionSpan
+
     agent_span = None
     tool_spans: List[ToolExecutionSpan] = []
 
