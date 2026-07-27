@@ -260,6 +260,40 @@ class TestRAGASAdapterEmbeddedParsing:
         assert metric.captured_sample.retrieved_contexts == ["AI is a branch of computer science."]
         assert metric.captured_sample.reference_contexts == ["AI is a branch of computer science."]
 
+    def test_embedded_json_list_context_preserves_chunks_and_order(self):
+        metric = FakeSingleTurnMetric()
+        adapter = RAGASAdapter(metric=metric)
+
+        chunks = ["chunk B", "chunk A", "chunk C"]
+        result = adapter(
+            _make_evaluator_input(user_content="What is AI?\n\nContext:\n" + json.dumps(chunks))
+        )
+
+        assert result.value == 0.9
+        assert metric.captured_sample.user_input == "What is AI?"
+        # Rank-aware metrics (context precision) need the original list, in order
+        assert metric.captured_sample.retrieved_contexts == chunks
+        assert metric.captured_sample.reference_contexts == chunks
+
+    def test_embedded_non_string_json_list_context_stays_single_chunk(self):
+        metric = FakeSingleTurnMetric()
+        adapter = RAGASAdapter(metric=metric)
+
+        embedded = json.dumps([{"text": "chunk"}, 42])
+        result = adapter(_make_evaluator_input(user_content="What is AI?\n\nContext:\n" + embedded))
+
+        assert result.value == 0.9
+        assert metric.captured_sample.retrieved_contexts == [embedded]
+
+    def test_embedded_empty_json_list_context_stays_single_chunk(self):
+        metric = FakeSingleTurnMetric()
+        adapter = RAGASAdapter(metric=metric)
+
+        result = adapter(_make_evaluator_input(user_content="What is AI?\n\nContext:\n[]"))
+
+        assert result.value == 0.9
+        assert metric.captured_sample.retrieved_contexts == ["[]"]
+
     def test_parses_combined_context_and_reference(self):
         metric = FakeSingleTurnMetric()
         adapter = RAGASAdapter(metric=metric)

@@ -59,6 +59,13 @@ class RAGASAdapter(BaseAdapter):
             custom_mapper=my_mapper,
         )
 
+    Embedded context: context embedded in the first user message (after the
+    ``Context:`` separator) is interpreted by shape. If the embedded
+    text parses as a JSON list of strings it is recovered as the original
+    context-chunk list — preserving chunk boundaries and rank order for
+    rank-aware metrics such as LLMContextPrecision. Any other text becomes a
+    single-element ``retrieved_contexts`` list.
+
     Multi-turn metrics: the reference for a multi-turn metric is interpreted
     by shape. If the extracted/embedded reference text parses as a JSON list of
     ``{"name": ..., "args": {...}}`` objects it becomes ``reference_tool_calls``
@@ -288,8 +295,9 @@ class RAGASAdapter(BaseAdapter):
             fields["retrieved_contexts"] = result.retrieval_context
             fields["reference_contexts"] = result.retrieval_context
         elif embedded_context:
-            fields["retrieved_contexts"] = [embedded_context]
-            fields["reference_contexts"] = [embedded_context]
+            contexts = self._interpret_embedded_context(embedded_context)
+            fields["retrieved_contexts"] = contexts
+            fields["reference_contexts"] = contexts
         elif result.context:
             fields["retrieved_contexts"] = result.context
             fields["reference_contexts"] = result.context
@@ -407,6 +415,26 @@ class RAGASAdapter(BaseAdapter):
                 return "reference_topics", parsed
 
         return "reference", reference
+
+    @staticmethod
+    def _interpret_embedded_context(embedded_context: str) -> List[str]:
+        """Interpret embedded context text by shape.
+
+        A JSON list of strings is recovered as the original context-chunk
+        list, preserving chunk boundaries AND order. This matters for
+        rank-aware metrics (LLMContextPrecision and friends): joining N
+        ranked chunks into one string collapses precision@k to a binary
+        judgment on a single blob. Producers that have a chunk list should
+        embed it as ``json.dumps(chunks)``; any other text is treated as a
+        single chunk (backward compatible).
+        """
+        try:
+            parsed = json.loads(embedded_context)
+        except (json.JSONDecodeError, ValueError):
+            return [embedded_context]
+        if isinstance(parsed, list) and parsed and all(isinstance(item, str) for item in parsed):
+            return parsed
+        return [embedded_context]
 
     @staticmethod
     def _coerce_tool_calls(items: Optional[List[Any]]) -> List[Any]:
